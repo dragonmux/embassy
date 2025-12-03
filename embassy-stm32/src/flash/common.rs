@@ -29,9 +29,7 @@ impl<'d> Flash<'d, Blocking> {
             _mode: PhantomData,
         }
     }
-}
 
-impl<'d, MODE> Flash<'d, MODE> {
     /// Split this flash driver into one instance per flash memory region.
     ///
     /// See module-level documentation for details on how memory regions work.
@@ -69,6 +67,58 @@ impl<'d, MODE> Flash<'d, MODE> {
     /// For example, to erase address `0x0801_0000` you have to use offset `0x1_0000`.
     pub fn blocking_erase(&mut self, from: u32, to: u32) -> Result<(), Error> {
         unsafe { blocking_erase(FLASH_BASE as u32, from, to, erase_sector_unlocked) }
+    }
+}
+
+impl<'d> Flash<'d, Async> {
+    /// Create a new flash driver, usable in async mode.
+    pub fn new_async(p: Peri<'d, FLASH>) -> Self {
+        #[cfg(bank_setup_configurable)]
+        // Check if the configuration matches the embassy setup
+        super::check_bank_setup();
+
+        Self {
+            inner: p,
+            _mode: PhantomData,
+        }
+    }
+
+    /// Get whether the FPEC is currently busy
+    ///
+    /// Returns an error if the controller indicates something has gone wrong
+    /// with an ongoing operation.
+    pub fn busy(&self) -> Result<bool, Error> {
+        family::status()
+    }
+
+    /// Begin erasing a sector of Flash
+    ///
+    /// NOTE: sector_addr is an absolute address which we use to determine the sector
+    /// to erase.
+    pub fn erase_sector(&self, sector_addr: u32) -> Result<(), Error> {
+        begin_erase_sector(sector_addr)
+    }
+
+    /// Write a block of data into Flash
+    ///
+    /// NOTE: start_address is an absolute address for where to write the data in Flash.
+    /// NOTE: the length of bytes may not exceed the write size for the device.
+    pub fn write(&self, start_address: u32, bytes: &[u8]) -> Result<(), Error> {
+        unsafe {
+            begin_write(
+                FLASH_BASE as u32,
+                FLASH_SIZE as u32,
+                start_address,
+                bytes
+            )
+        }
+    }
+
+    /// Complete the operation that was ongoing now it has completed
+    ///
+    /// NOTE: returns an error if the controller is actually still busy.
+    pub fn complete_operation(&self) -> Result<(), Error> {
+        family::complete_operation()
     }
 }
 
@@ -117,16 +167,51 @@ pub(super) unsafe fn blocking_write(
     Ok(())
 }
 
+pub(super) unsafe fn begin_write(
+    base: u32,
+    size: u32,
+    start_address: u32,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    // Validate the start address is not somewhere whacky
+    let offset = start_address - base;
+    if start_address < base || start_address >= base + size {
+        return Err(Error::Miss);
+    }
+    if offset + bytes.len() as u32 > size || bytes.len() > WRITE_SIZE {
+        return Err(Error::Size);
+    }
+
+    // Do the tracing thing to indicate the operation
+    trace!("Writing {} bytes at 0x{:x}", bytes.len(), start_address);
+
+    // Set up the FPEC to begin the write
+    family::clear_all_err();
+    fence(Ordering::SeqCst);
+    family::unlock();
+    fence(Ordering::SeqCst);
+    family::enable_write();
+    fence(Ordering::SeqCst);
+
+    // Turn the byte buffer into a full chunk so we can cope with unaligned writes
+    let mut chunk = [0xffu8; WRITE_SIZE];
+    let offset = start_address as usize & (WRITE_SIZE - 1);
+    chunk[offset..].copy_from_slice(bytes);
+
+    // Kick off the write and head home
+    family::write(start_address, &chunk)
+}
+
 pub(super) unsafe fn write_chunk_unlocked(address: u32, chunk: &[u8]) -> Result<(), Error> {
     family::clear_all_err();
     fence(Ordering::SeqCst);
     family::unlock();
     fence(Ordering::SeqCst);
-    family::enable_blocking_write();
+    family::enable_write();
     fence(Ordering::SeqCst);
 
     let _on_drop = OnDrop::new(|| {
-        family::disable_blocking_write();
+        family::disable_write();
         fence(Ordering::SeqCst);
         family::lock();
     });
@@ -136,6 +221,21 @@ pub(super) unsafe fn write_chunk_unlocked(address: u32, chunk: &[u8]) -> Result<
 
 pub(super) unsafe fn write_chunk_with_critical_section(address: u32, chunk: &[u8]) -> Result<(), Error> {
     critical_section::with(|_| write_chunk_unlocked(address, chunk))
+}
+
+pub(super) fn begin_erase_sector(
+    start_address: u32
+) -> Result<(), Error> {
+    let regions = get_flash_regions();
+    let sector = get_sector(start_address, regions);
+    let end_address = start_address + sector.size;
+
+    ensure_sector_aligned(start_address, end_address, regions)?;
+
+    trace!("Erasing from 0x{:x} to 0x{:x}", start_address, end_address);
+
+    family::begin_erase_sector(&sector);
+    Ok(())
 }
 
 pub(super) unsafe fn blocking_erase(
@@ -225,7 +325,7 @@ impl<MODE> embedded_storage::nor_flash::ErrorType for Flash<'_, MODE> {
     type Error = Error;
 }
 
-impl<MODE> embedded_storage::nor_flash::ReadNorFlash for Flash<'_, MODE> {
+impl embedded_storage::nor_flash::ReadNorFlash for Flash<'_, Blocking> {
     const READ_SIZE: usize = READ_SIZE;
 
     fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
@@ -237,7 +337,7 @@ impl<MODE> embedded_storage::nor_flash::ReadNorFlash for Flash<'_, MODE> {
     }
 }
 
-impl<MODE> embedded_storage::nor_flash::NorFlash for Flash<'_, MODE> {
+impl embedded_storage::nor_flash::NorFlash for Flash<'_, Blocking> {
     const WRITE_SIZE: usize = WRITE_SIZE;
     const ERASE_SIZE: usize = MAX_ERASE_SIZE;
 

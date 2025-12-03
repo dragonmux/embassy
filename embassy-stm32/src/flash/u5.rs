@@ -5,14 +5,14 @@ use super::{FlashBank, FlashSector, WRITE_SIZE};
 use crate::flash::Error;
 use crate::pac;
 
-pub(crate) unsafe fn lock() {
+pub(crate) fn lock() {
     #[cfg(feature = "trustzone-secure")]
     pac::FLASH.seccr().modify(|w| w.set_lock(true));
     #[cfg(not(feature = "trustzone-secure"))]
     pac::FLASH.nscr().modify(|w| w.set_lock(true));
 }
 
-pub(crate) unsafe fn unlock() {
+pub(crate) fn unlock() {
     #[cfg(feature = "trustzone-secure")]
     if pac::FLASH.seccr().read().lock() {
         pac::FLASH.seckeyr().write_value(0x4567_0123);
@@ -25,7 +25,7 @@ pub(crate) unsafe fn unlock() {
     }
 }
 
-pub(crate) unsafe fn enable_blocking_write() {
+pub(crate) fn enable_write() {
     assert_eq!(0, WRITE_SIZE % 4);
 
     #[cfg(feature = "trustzone-secure")]
@@ -38,14 +38,14 @@ pub(crate) unsafe fn enable_blocking_write() {
     });
 }
 
-pub(crate) unsafe fn disable_blocking_write() {
+pub(crate) fn disable_write() {
     #[cfg(feature = "trustzone-secure")]
     pac::FLASH.seccr().write(|w| w.set_pg(false));
     #[cfg(not(feature = "trustzone-secure"))]
     pac::FLASH.nscr().write(|w| w.set_pg(false));
 }
 
-pub(crate) unsafe fn blocking_write(start_address: u32, buf: &[u8; WRITE_SIZE]) -> Result<(), Error> {
+pub(crate) unsafe fn write(start_address: u32, buf: &[u8; WRITE_SIZE]) -> Result<(), Error> {
     let mut address = start_address;
     for val in buf.chunks(4) {
         write_volatile(address as *mut u32, u32::from_le_bytes(unwrap!(val.try_into())));
@@ -55,10 +55,15 @@ pub(crate) unsafe fn blocking_write(start_address: u32, buf: &[u8; WRITE_SIZE]) 
         fence(Ordering::SeqCst);
     }
 
+    Ok(())
+}
+
+pub(crate) unsafe fn blocking_write(start_address: u32, buf: &[u8; WRITE_SIZE]) -> Result<(), Error> {
+    write(start_address, buf)?;
     blocking_wait_ready()
 }
 
-pub(crate) unsafe fn blocking_erase_sector(sector: &FlashSector) -> Result<(), Error> {
+pub(crate) fn begin_erase_sector(sector: &FlashSector) {
     #[cfg(feature = "trustzone-secure")]
     pac::FLASH.seccr().modify(|w| {
         w.set_per(pac::flash::vals::SeccrPer::B_0X1);
@@ -90,17 +95,67 @@ pub(crate) unsafe fn blocking_erase_sector(sector: &FlashSector) -> Result<(), E
     pac::FLASH.nscr().modify(|w| {
         w.set_strt(true);
     });
+}
 
-    let ret: Result<(), Error> = blocking_wait_ready();
+pub(crate) fn end_erase() -> Result<(), Error> {
+    // Check if the operation actually finished
+    let result = status();
+    // If it did not, translate that into an error and early-return
+    if result == Ok(true) {
+        return Err(Error::Busy);
+    }
+    // Otherwise, clean up and reset any error flags
     #[cfg(feature = "trustzone-secure")]
     pac::FLASH.seccr().modify(|w| w.set_per(false));
     #[cfg(not(feature = "trustzone-secure"))]
     pac::FLASH.nscr().modify(|w| w.set_per(false));
     clear_all_err();
-    ret
+    // Re-lock to prevent any accidents
+    lock();
+    // Purcolate any errors upwards, and turn the status into the unit type
+    result.map(|_| ())
 }
 
-pub(crate) unsafe fn clear_all_err() {
+pub(crate) fn blocking_erase_sector(sector: &FlashSector) -> Result<(), Error> {
+    begin_erase_sector(sector);
+    // We discard this Result because we regenerate it in end_erase anyway.
+    let _ = blocking_wait_ready();
+    end_erase()
+}
+
+pub(crate) fn complete_operation() -> Result<(), Error> {
+    // Check if the operation actually finished
+    let result = status();
+    // If it did not, translate that into an error and early-return
+    if result == Ok(true) {
+        return Err(Error::Busy);
+    }
+
+    // Otherwise, clean up and reset any error flags
+    clear_all_err();
+
+    // Figure out what kind of operation was ongoing
+    #[cfg(feature = "trustzone-secure")]
+    let cr = pac::FLASH.seccr().read();
+    #[cfg(not(feature = "trustzone-secure"))]
+    let cr = pac::FLASH.nscr().read();
+
+    // Disable the operation and re-lock the FPEC
+    if cr.pg() {
+        disable_write();
+    } else {
+        #[cfg(feature = "trustzone-secure")]
+        pac::FLASH.seccr().modify(|w| w.set_per(false));
+        #[cfg(not(feature = "trustzone-secure"))]
+        pac::FLASH.nscr().modify(|w| w.set_per(false));
+    }
+    lock();
+
+    // Purcolate an errors upwards, and turn the status into the unit type
+    result.map(|_| ())
+}
+
+pub(crate) fn clear_all_err() {
     // read and write back the same value.
     // This clears all "write 1 to clear" bits.
     #[cfg(feature = "trustzone-secure")]
@@ -109,35 +164,47 @@ pub(crate) unsafe fn clear_all_err() {
     pac::FLASH.nssr().modify(|_| {});
 }
 
-unsafe fn blocking_wait_ready() -> Result<(), Error> {
-    loop {
-        #[cfg(feature = "trustzone-secure")]
-        let sr = pac::FLASH.secsr().read();
-        #[cfg(not(feature = "trustzone-secure"))]
-        let sr = pac::FLASH.nssr().read();
+pub(crate) fn status() -> Result<bool, Error> {
+    // Read out the status register
+    #[cfg(feature = "trustzone-secure")]
+    let sr = pac::FLASH.secsr().read();
+    #[cfg(not(feature = "trustzone-secure"))]
+    let sr = pac::FLASH.nssr().read();
 
-        if !sr.bsy() {
-            if sr.pgserr() {
-                return Err(Error::Seq);
-            }
-
-            if sr.sizerr() {
-                return Err(Error::Size);
-            }
-
-            if sr.pgaerr() {
-                return Err(Error::Unaligned);
-            }
-
-            if sr.wrperr() {
-                return Err(Error::Protected);
-            }
-
-            if sr.progerr() {
-                return Err(Error::Prog);
-            }
-
-            return Ok(());
+    // If the controller indicates it's still busy, return so
+    if sr.bsy() {
+        Ok(true)
+    } else {
+        // Otherwise see what error happened (if any) and return that
+        if sr.pgserr() {
+            return Err(Error::Seq);
         }
+
+        if sr.sizerr() {
+            return Err(Error::Size);
+        }
+
+        if sr.pgaerr() {
+            return Err(Error::Unaligned);
+        }
+
+        if sr.wrperr() {
+            return Err(Error::Protected);
+        }
+
+        if sr.progerr() {
+            return Err(Error::Prog);
+        }
+
+        // If there was no error, happy days - just return idle
+        Ok(false)
     }
+}
+
+fn blocking_wait_ready() -> Result<(), Error> {
+    Ok(
+        while status()? {
+            continue;
+        }
+    )
 }
