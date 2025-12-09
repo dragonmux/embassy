@@ -217,6 +217,17 @@ pub(crate) unsafe fn init(config: Config) {
             _ => {}
         }
 
+        // We are presently executing off this clock, so get the HSI16 up so we can actually reconfigure
+        // the MSIS range used, and switch to it
+        RCC.cr().modify(|w| {
+            w.set_hsion(true);
+        });
+        while !RCC.cr().read().hsirdy() {}
+        RCC.cfgr1().modify(|w| {
+            w.set_sw(Sysclk::HSI);
+        });
+        while RCC.cfgr1().read().sws() != Sysclk::HSI {}
+
         // RM0456 § 11.8.2: spin until MSIS is off or MSIS is ready before setting its range
         loop {
             let cr = RCC.cr().read();
@@ -225,11 +236,12 @@ pub(crate) unsafe fn init(config: Config) {
             }
         }
 
+        // Now switch ranges, and set up any calibration etc required
         RCC.icscr1().modify(|w| {
             w.set_msisrange(range);
             w.set_msirgsel(Msirgsel::ICSCR1);
         });
-        RCC.cr().write(|w| {
+        RCC.cr().modify(|w| {
             w.set_msipllen(false);
             w.set_msison(true);
         });
@@ -243,7 +255,16 @@ pub(crate) unsafe fn init(config: Config) {
         } else {
             msirange_to_hertz(range)
         };
+        // Wait until the MSIS is ready, then switch back to it to continue
         while !RCC.cr().read().msisrdy() {}
+        RCC.cfgr1().modify(|w| {
+            w.set_sw(Sysclk::MSIS);
+        });
+        while RCC.cfgr1().read().sws() != Sysclk::MSIS {}
+        // Finally, if the HSI is not needed then switch it back off
+        (!config.hsi).then(|| {
+            RCC.cr().modify(|w| w.set_hsion(false));
+        });
         msis
     });
 
@@ -341,6 +362,7 @@ pub(crate) unsafe fn init(config: Config) {
         hse.freq
     });
 
+    // Set up the HSI48 if requested
     let hsi48 = config.hsi48.map(super::init_hsi48);
 
     // There's a possibility that a bootloader that ran before us has configured the system clock
@@ -353,6 +375,17 @@ pub(crate) unsafe fn init(config: Config) {
     RCC.cfgr1().modify(|w| w.set_sw(default_system_clock_source));
     while RCC.cfgr1().read().sws() != default_system_clock_source {}
 
+    // There's a possibility that a bootloader that ran before us has configured the system clock
+    // source to be PLL1_R. In that case we'd get forever stuck on (de)configuring PLL1 as the chip
+    // prohibits disabling PLL1 when it's used as a source for system clock. Change the system
+    // clock source to MSIS which doesn't suffer from this conflict. The correct source per the
+    // provided config is then set further down.
+    // See https://github.com/embassy-rs/embassy/issues/5072
+    let default_system_clock_source = Config::default().sys;
+    RCC.cfgr1().modify(|w| w.set_sw(default_system_clock_source));
+    while RCC.cfgr1().read().sws() != default_system_clock_source {}
+
+    // Configure the PLLs (including the boost clock on PLL1)
     let pll_input = PllInput { hse, hsi, msi: msis };
     let pll1 = init_pll(PllInstance::Pll1, config.pll1, &pll_input, config.voltage_range);
     let pll2 = init_pll(PllInstance::Pll2, config.pll2, &pll_input, config.voltage_range);
